@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "excelmaster"
+version = "0.1.0"
+description = "AI-powered Excel dashboard generation engine"
+requires-python = ">=3.10"
+dependencies = [
+    "openpyxl>=3.1.2",
+    "pandas>=2.1.0",
+    "numpy>=1.26.0",
+    "openai>=1.12.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "typer[all]>=0.9.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+    "xlsxwriter>=3.1.9",
+    "pillow>=10.0.0",
+]
+
+[project.scripts]
+excelmaster = "excelmaster.cli.app:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/excelmaster"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

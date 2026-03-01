@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Large input CSVs (too big for GitHub; download separately)
+data/input/*.csv
+
+# Generated data (regenerate with: excelmaster generate-data all)
+data/*.xlsx
+
+# Generated dashboards (regenerate with: excelmaster run all)
+output/*.xlsx
+data/output/*.xlsx
+
+# Keep output directories
+!output/.gitkeep
+!data/output/.gitkeep
+
+# Agent Config
+.agent/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
