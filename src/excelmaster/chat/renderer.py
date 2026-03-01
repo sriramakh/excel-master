@@ -24,10 +24,19 @@ from ..models import (
     ColorTheme,
     DashboardConfig,
     DashboardTemplate,
+    DatasetProfile,
     KPIConfig,
     NumberFormat,
 )
 from .models import (
+    CellFormatOp,
+    CellWrite,
+    CommentOp,
+    ConditionalFormatOp,
+    DataValidationOp,
+    HyperlinkOp,
+    ImageOp,
+    MergeOp,
     ObjectType,
     PlacedChart,
     PlacedFilterPanel,
@@ -41,6 +50,27 @@ from .models import (
     SheetLayout,
     WorkbookState,
 )
+
+
+# ── Cell Address Parsing ──────────────────────────────────────────────────────
+
+def _parse_cell_address(cell: str) -> tuple[int, int]:
+    """Parse 'B3' → (row=2, col=1). Zero-based."""
+    from xlsxwriter.utility import xl_cell_to_rowcol
+    return xl_cell_to_rowcol(cell)
+
+
+def _parse_range_address(rng: str) -> tuple[int, int, int, int]:
+    """Parse 'A1:F20' → (r1, c1, r2, c2). Zero-based."""
+    from xlsxwriter.utility import xl_range_abs
+    from xlsxwriter.utility import xl_cell_to_rowcol
+    if ":" in rng:
+        parts = rng.split(":")
+        r1, c1 = xl_cell_to_rowcol(parts[0])
+        r2, c2 = xl_cell_to_rowcol(parts[1])
+        return r1, c1, r2, c2
+    r, c = xl_cell_to_rowcol(rng)
+    return r, c, r, c
 
 
 class FlexibleTemplate(BaseXLTemplate):
@@ -99,11 +129,27 @@ class FlexibleTemplate(BaseXLTemplate):
     def build(self, df: pd.DataFrame, output_path: Path) -> Path:
         return self.build_from_state(df, output_path)
 
-    def build_from_state(self, df: pd.DataFrame, output_path: Path) -> Path:
-        """Full render: write data, then render every sheet's objects."""
+    def build_from_state(
+        self,
+        df: pd.DataFrame,
+        output_path: Path,
+        profile: DatasetProfile | None = None,
+    ) -> Path:
+        """Full render: write data, then render every sheet's objects.
+
+        Args:
+            df: The dataset to render.
+            output_path: Where to save the xlsx.
+            profile: If provided, enables Deep Analysis sheet generation.
+        """
         output_path = Path(output_path)
         self._init_workbook(output_path)
         self._write_data_sheet(df)
+
+        # ── Deep Analysis generation ──────────────────────────────────────
+        if profile is not None:
+            self._store_for_analysis(df, profile)
+            self._generate_deep_analysis(df, profile)
 
         ws_dash = self._ws_dash
         t = self.theme
@@ -134,9 +180,16 @@ class FlexibleTemplate(BaseXLTemplate):
                 continue  # already rendered above
             self._dispatch_render(obj, df, ws_dash)
 
-        if dash_sheet.freeze_row:
-            ws_dash.freeze_panes(dash_sheet.freeze_row, 0)
+        # ── Cell-level operations on Dashboard ─────────────────────────
+        self._render_cell_operations(dash_sheet, ws_dash)
+
+        if dash_sheet.freeze_row or dash_sheet.freeze_col:
+            ws_dash.freeze_panes(dash_sheet.freeze_row, dash_sheet.freeze_col)
         ws_dash.set_zoom(dash_sheet.zoom or 85)
+        if dash_sheet.tab_color:
+            ws_dash.set_tab_color(dash_sheet.tab_color)
+        if dash_sheet.hidden:
+            ws_dash.hide()
 
         # ── Render extra sheets ──────────────────────────────────────────────
         for sheet_layout in self.state.sheets:
@@ -150,9 +203,14 @@ class FlexibleTemplate(BaseXLTemplate):
                 ws_extra.set_column(c, c, COL_W)
             for obj in sheet_layout.sorted_objects():
                 self._dispatch_render(obj, df, ws_extra)
-            if sheet_layout.freeze_row:
-                ws_extra.freeze_panes(sheet_layout.freeze_row, 0)
+            self._render_cell_operations(sheet_layout, ws_extra)
+            if sheet_layout.freeze_row or sheet_layout.freeze_col:
+                ws_extra.freeze_panes(sheet_layout.freeze_row, sheet_layout.freeze_col)
             ws_extra.set_zoom(sheet_layout.zoom or 85)
+            if sheet_layout.tab_color:
+                ws_extra.set_tab_color(sheet_layout.tab_color)
+            if sheet_layout.hidden:
+                ws_extra.hide()
 
         return self._close(output_path)
 
@@ -214,15 +272,56 @@ class FlexibleTemplate(BaseXLTemplate):
             if c + card_span > N_COLS:
                 break
             bg = card_colors[i % len(card_colors)]
-            # Use the Dashboard worksheet for KPI tiles (they need _ws_dash for sparklines)
             saved_ws = self._ws_dash
             self._ws_dash = ws
-            self._write_kpi_tile(
-                row, c, card_span, 5, kpi, df, bg,
+            self._write_kpi_tile_formatted(
+                row, c, card_span, 5, kpi, df, bg, ws,
                 font_color=t.text_light,
-                filter_ref=self._filter_cell,
             )
             self._ws_dash = saved_ws
+
+    def _write_kpi_tile_formatted(
+        self,
+        row: int, col: int, span_cols: int, span_rows: int,
+        kpi: KPIConfig, df: pd.DataFrame, bg: str,
+        ws=None,
+        font_color: str | None = None,
+    ) -> None:
+        """Write a KPI tile with pre-formatted display text and sparkline."""
+        ws = ws or self._ws_dash
+        sf = self._sf
+        t = self.theme
+
+        bg_fmt = sf.kpi_bg(bg)
+        lbl_fmt = sf.kpi_label(bg)
+        val_fmt = sf.kpi_value(bg, font_color or (t.text_light if t.dark_mode else None))
+
+        # Top padding
+        ws.merge_range(row, col, row, col + span_cols - 1, "", bg_fmt)
+
+        # Label row
+        lbl_row = row + 1
+        ws.set_row(lbl_row, 15)
+        label_txt = kpi.icon + "  " + kpi.label if kpi.icon else kpi.label
+        ws.merge_range(lbl_row, col, lbl_row, col + span_cols - 1, label_txt, lbl_fmt)
+
+        # Value row — formatted static text (e.g. "$3.1B", "45.2%", "12.5K")
+        val_row = row + 2
+        ws.set_row(val_row, 32)
+        display_val = self._compute_kpi_static(df, kpi)
+        ws.merge_range(val_row, col, val_row, col + span_cols - 1, display_val, val_fmt)
+
+        # Sparkline row
+        if span_rows >= 4:
+            spark_row = row + 3
+            ws.set_row(spark_row, 18)
+            for ci in range(col, col + span_cols):
+                ws.write_blank(spark_row, ci, None, bg_fmt)
+            self._add_kpi_sparkline(df, kpi, spark_row, col + span_cols // 2, bg)
+
+        # Bottom padding
+        bot_row = row + span_rows - 1
+        ws.merge_range(bot_row, col, bot_row, col + span_cols - 1, "", bg_fmt)
 
     def _render_section_header(self, obj: PlacedObject, df: pd.DataFrame, ws) -> None:
         p: PlacedSectionHeader = obj.payload  # type: ignore[assignment]
@@ -371,3 +470,109 @@ class FlexibleTemplate(BaseXLTemplate):
         row = obj.anchor_row
         ws.set_row(row, 40 if p.style == "heading" else 30)
         ws.merge_range(row, 0, row + obj.height_rows - 1, N_COLS - 1, p.content, fmt)
+
+    # ── Deep Analysis Generation ─────────────────────────────────────────────
+
+    def _generate_deep_analysis(
+        self,
+        df: pd.DataFrame,
+        profile: DatasetProfile,
+    ) -> None:
+        """Generate deep analysis via LLM and attach to config."""
+        try:
+            from ..dashboard.deep_analysis import (
+                compute_deep_stats,
+                build_analysis_prompt,
+                safe_parse_analysis,
+            )
+            from ..dashboard.llm_client import LLMClient
+
+            stats = compute_deep_stats(df, profile)
+            sys_prompt, user_prompt = build_analysis_prompt(
+                stats, profile, self.config,
+            )
+            llm = LLMClient()
+            raw = llm.generate_json(
+                sys_prompt, user_prompt, max_tokens_override=6144,
+            )
+            self.config.deep_analysis = safe_parse_analysis(raw)
+        except Exception:
+            # Deep analysis is optional — never break the build
+            self.config.deep_analysis = None
+
+    # ── Cell-Level Operations ─────────────────────────────────────────────────
+
+    def _render_cell_operations(self, sheet_layout: SheetLayout, ws) -> None:
+        """Render all cell-level operations after placed objects."""
+        wb = self._wb
+
+        # 1. Row heights
+        for row_idx, height in sheet_layout.row_heights.items():
+            ws.set_row(row_idx, height)
+
+        # 2. Column widths
+        for col_idx, width in sheet_layout.col_widths.items():
+            ws.set_column(col_idx, col_idx, width)
+
+        # 3. Hidden rows
+        for r in sheet_layout.hidden_rows:
+            ws.set_row(r, None, None, {"hidden": True})
+
+        # 4. Hidden columns
+        for c in sheet_layout.hidden_cols:
+            ws.set_column(c, c, None, None, {"hidden": True})
+
+        # 5. Cell writes (values + formulas + inline format)
+        for cw in sheet_layout.cell_writes:
+            row, col = _parse_cell_address(cw.cell)
+            fmt = wb.add_format(cw.format) if cw.format else None
+            if cw.value is not None:
+                if isinstance(cw.value, str) and cw.value.startswith("="):
+                    ws.write_formula(row, col, cw.value, fmt)
+                else:
+                    ws.write(row, col, cw.value, fmt)
+            elif fmt:
+                ws.write_blank(row, col, "", fmt)
+
+        # 6. Cell formats (overlay formatting on a range)
+        for cf in sheet_layout.cell_formats:
+            r1, c1, r2, c2 = _parse_range_address(cf.range)
+            fmt = wb.add_format(cf.format) if cf.format else None
+            if fmt:
+                for r in range(r1, r2 + 1):
+                    for c in range(c1, c2 + 1):
+                        ws.write_blank(r, c, "", fmt)
+
+        # 7. Merges
+        for m in sheet_layout.merges:
+            r1, c1, r2, c2 = _parse_range_address(m.range)
+            fmt = wb.add_format(m.format) if m.format else None
+            ws.merge_range(r1, c1, r2, c2, m.value, fmt)
+
+        # 8. Conditional formats
+        for cf in sheet_layout.conditional_formats:
+            r1, c1, r2, c2 = _parse_range_address(cf.range)
+            ws.conditional_format(r1, c1, r2, c2, cf.params)
+
+        # 9. Data validations
+        for dv in sheet_layout.data_validations:
+            r1, c1, r2, c2 = _parse_range_address(dv.range)
+            ws.data_validation(r1, c1, r2, c2, dv.params)
+
+        # 10. Hyperlinks
+        for hl in sheet_layout.hyperlinks:
+            row, col = _parse_cell_address(hl.cell)
+            ws.write_url(row, col, hl.url, string=hl.display_text or hl.url)
+
+        # 11. Comments
+        for cm in sheet_layout.comments:
+            row, col = _parse_cell_address(cm.cell)
+            ws.write_comment(row, col, cm.text, {"author": cm.author})
+
+        # 12. Images
+        for img in sheet_layout.images:
+            row, col = _parse_cell_address(img.cell)
+            ws.insert_image(row, col, img.image_path, {
+                "x_scale": img.x_scale,
+                "y_scale": img.y_scale,
+            })

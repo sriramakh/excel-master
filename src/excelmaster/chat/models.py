@@ -86,6 +86,56 @@ PayloadUnion = Union[
 ]
 
 
+# ─── Cell-Level Operation Models ────────────────────────────────────────────
+
+class CellWrite(BaseModel):
+    cell: str              # "A1" or "B3"
+    value: Any = None      # string, number, formula (=...), or None
+    format: dict = Field(default_factory=dict)  # {bold: True, bg_color: "#FF0000", ...}
+
+
+class CellFormatOp(BaseModel):
+    range: str             # "A1:F20"
+    format: dict = Field(default_factory=dict)
+
+
+class ConditionalFormatOp(BaseModel):
+    range: str
+    rule_type: str = ""    # "3_color_scale", "data_bar", "icon_set", "cell_is"
+    params: dict = Field(default_factory=dict)
+
+
+class DataValidationOp(BaseModel):
+    range: str
+    validation_type: str = "list"  # "list", "whole", "decimal", "custom"
+    params: dict = Field(default_factory=dict)
+
+
+class MergeOp(BaseModel):
+    range: str
+    value: str = ""
+    format: dict = Field(default_factory=dict)
+
+
+class HyperlinkOp(BaseModel):
+    cell: str
+    url: str
+    display_text: str = ""
+
+
+class CommentOp(BaseModel):
+    cell: str
+    text: str
+    author: str = "Excel Master"
+
+
+class ImageOp(BaseModel):
+    cell: str
+    image_path: str
+    x_scale: float = 1.0
+    y_scale: float = 1.0
+
+
 # ─── Placed Object ───────────────────────────────────────────────────────────
 
 class PlacedObject(BaseModel):
@@ -106,7 +156,23 @@ class SheetLayout(BaseModel):
     name: str = "Dashboard"
     objects: list[PlacedObject] = Field(default_factory=list)
     freeze_row: int = 0
+    freeze_col: int = 0
     zoom: int = 100
+    tab_color: str = ""
+    hidden: bool = False
+    # Cell-level operations (rendered after placed objects)
+    cell_writes: list[CellWrite] = Field(default_factory=list)
+    cell_formats: list[CellFormatOp] = Field(default_factory=list)
+    conditional_formats: list[ConditionalFormatOp] = Field(default_factory=list)
+    data_validations: list[DataValidationOp] = Field(default_factory=list)
+    merges: list[MergeOp] = Field(default_factory=list)
+    hyperlinks: list[HyperlinkOp] = Field(default_factory=list)
+    comments: list[CommentOp] = Field(default_factory=list)
+    images: list[ImageOp] = Field(default_factory=list)
+    row_heights: dict[int, float] = Field(default_factory=dict)
+    col_widths: dict[int, float] = Field(default_factory=dict)
+    hidden_rows: list[int] = Field(default_factory=list)
+    hidden_cols: list[int] = Field(default_factory=list)
 
     def next_free_row(self) -> int:
         if not self.objects:

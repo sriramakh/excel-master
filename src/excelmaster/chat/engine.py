@@ -709,11 +709,11 @@ class ChatEngine:
                 from rich.status import Status
                 with console.status("[bold cyan]Rendering dashboard...", spinner="dots"):
                     template = FlexibleTemplate(self.state)
-                    template.build_from_state(self.df, self.output_path)
+                    template.build_from_state(self.df, self.output_path, profile=self.profile)
             else:
                 print("Rendering dashboard...")
                 template = FlexibleTemplate(self.state)
-                template.build_from_state(self.df, self.output_path)
+                template.build_from_state(self.df, self.output_path, profile=self.profile)
         except Exception as e:
             print(f"Render error: {e}")
             traceback.print_exc()

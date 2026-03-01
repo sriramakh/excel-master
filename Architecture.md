@@ -15,7 +15,7 @@ Excel Master follows a **pipeline architecture** with four major stages:
 └─────────────┘     └─────────────┘     └─────────────────┘     └──────────────┘
 ```
 
-Additionally, a **Chat Mode** wraps the pipeline in an interactive REPL, allowing incremental dashboard construction via natural language.
+On top of this, an **Agent Layer** provides an OpenAI tool-calling interface with 13 tools, an object registry, and a full Python API (`AgentSession`). A legacy **Chat Mode** wraps the pipeline in an interactive JSON-action REPL.
 
 ---
 
@@ -28,7 +28,15 @@ src/excelmaster/
 ├── models.py                    # Shared Pydantic data models
 │
 ├── cli/                         # User-facing CLI layer
-│   └── app.py                   # Typer commands
+│   └── app.py                   # Typer commands (incl. `agent` command)
+│
+├── agent/                       # Agentic layer (NEW)
+│   ├── __init__.py              # Exports AgentSession
+│   ├── session.py               # AgentSession: Python API, REPL, undo/redo
+│   ├── tools.py                 # 13 OpenAI function/tool schemas
+│   ├── tool_executor.py         # Dispatches tool calls → WorkbookState mutations
+│   ├── llm_bridge.py            # ToolCallingBridge: OpenAI tool-calling wrapper
+│   └── registry.py              # ObjectRegistry: tracks artifacts by ID
 │
 ├── data/                        # Data generation & profiling
 │   ├── data_engine.py           # Profiling, multi-sheet join, orchestration
@@ -54,12 +62,12 @@ src/excelmaster/
 │       ├── marketing_xl.py
 │       └── minimal_clean_xl.py
 │
-└── chat/                        # Interactive chat mode
-    ├── engine.py                # Chat REPL + action execution
-    ├── models.py                # WorkbookState, SheetLayout, actions
+└── chat/                        # Legacy interactive chat mode
+    ├── engine.py                # Chat REPL + JSON-action execution
+    ├── models.py                # WorkbookState, SheetLayout, cell-level ops
     ├── prompts.py               # LLM prompt construction
     ├── layout.py                # Object positioning engine
-    └── renderer.py              # FlexibleTemplate (state → xlsx)
+    └── renderer.py              # FlexibleTemplate (state → xlsx + cell ops)
 ```
 
 ---
@@ -284,20 +292,146 @@ StyleFactory(workbook, theme)
 
 ---
 
-## Chat Mode Architecture
+## Agent Layer Architecture (`agent/`)
 
-The chat system adds an interactive layer on top of the rendering pipeline:
+The agent layer provides an OpenAI tool-calling interface on top of the shared `WorkbookState` and rendering pipeline.
+
+### Component Overview
+
+```
+AgentSession (session.py)
+├── load()                        # Read data, profile, init conversation
+├── execute_instruction(text)     # NL → LLM tool calling → execute → result
+├── execute_tool(name, args)      # Direct tool call (no LLM, instant)
+├── auto_dashboard()              # LLM template selection → state
+├── save(path)                    # Render state → xlsx via FlexibleTemplate
+├── undo() / redo()               # State snapshots (max 30)
+├── get_state()                   # Full state dict for external agents
+├── get_tools()                   # Tool schemas for discovery
+└── run_repl()                    # Interactive CLI loop
+```
+
+### Tool Calling Flow
+
+```
+User instruction
+    │
+    ▼
+AgentSession.execute_instruction()
+    ├── Build user message (state snapshot + registry + instruction)
+    ├── Send to ToolCallingBridge.call_with_tools()
+    │   └── OpenAI chat.completions.create(tools=TOOLS, tool_choice="auto")
+    │       └── Returns: assistant text + tool_calls[]
+    │
+    ├── For each tool_call:
+    │   ├── ToolExecutor.execute(tool_name, args)
+    │   │   └── Dispatches to one of 13 handler methods
+    │   │       └── Mutates WorkbookState + registers in ObjectRegistry
+    │   └── Collect results
+    │
+    ├── Send tool results back to LLM (multi-round loop, max 5 rounds)
+    │   └── LLM may issue more tool_calls or return final text
+    │
+    └── Return {text, actions[], object_ids[]}
+```
+
+### 13 Agent Tools (`tools.py` + `tool_executor.py`)
+
+| # | Tool | State Mutation |
+|---|------|----------------|
+| 1 | `add_chart` | Creates `PlacedChart` → `LayoutEngine.insert_object()` → registry |
+| 2 | `modify_object` | Finds object by ID, patches payload fields in-place |
+| 3 | `remove_object` | Removes from sheet, reflows layout, removes from registry |
+| 4 | `add_kpi_row` | Creates `PlacedKPIRow` with validated `KPIConfig` list |
+| 5 | `add_table` | Creates `PlacedTable` (data) or `PlacedPivot` (pivot) |
+| 6 | `add_content` | Creates `PlacedTitle`, `PlacedSectionHeader`, or `PlacedText` |
+| 7 | `write_cells` | Appends `CellWrite` ops to `SheetLayout.cell_writes` |
+| 8 | `format_range` | Appends `CellFormatOp` to `SheetLayout.cell_formats` |
+| 9 | `sheet_operation` | Creates/renames/deletes/reorders sheets, sets tab color, hide/show |
+| 10 | `row_col_operation` | Sets `row_heights`/`col_widths`/`hidden_rows`/`hidden_cols` |
+| 11 | `add_excel_feature` | Appends `ConditionalFormatOp`, `DataValidationOp`, `MergeOp`, `HyperlinkOp`, `CommentOp`, `ImageOp`, or sets freeze/zoom |
+| 12 | `change_theme` | Sets `WorkbookState.theme_key` |
+| 13 | `query_workbook` | Read-only: lists objects, object details, data summary, sheets, registry |
+
+### Object Registry (`registry.py`)
+
+```
+ObjectRegistry
+├── register(op_type, sheet, location, description, turn, params) → entry_id
+├── get(entry_id) → RegistryEntry | None
+├── list_all(sheet?, op_type?) → list[RegistryEntry]
+├── remove(entry_id)
+├── to_snapshot() → str              # Compact text for LLM context injection
+├── snapshot_dict() → list[dict]     # Serializable for undo snapshots
+├── restore(data) → None             # Restore from snapshot
+└── clear()
+```
+
+`RegistryEntry` tracks: `id`, `op_type`, `sheet`, `location`, `description`, `created_at`, `turn`, `params`.
+
+The registry serves dual purposes:
+1. **LLM context** — injected into each turn so the LLM knows what exists and can reference IDs
+2. **Undo/redo** — snapshot and restore alongside `WorkbookState`
+
+### ToolCallingBridge (`llm_bridge.py`)
+
+Wraps OpenAI's `chat.completions.create` with tool definitions:
+
+```
+ToolCallingBridge
+├── call_with_tools(messages) → (text, tool_calls[])
+│   └── Retry loop with exponential backoff
+├── send_tool_results(messages, results) → (text, more_tool_calls[])
+│   └── Sends tool result messages for follow-up rounds
+└── build_assistant_tool_call_message(text, tool_calls) → dict
+    └── Builds proper assistant message with tool_calls for history
+```
+
+System preamble enforces: use exact column names, query before modifying, concise responses, appropriate chart types.
+
+---
+
+## Shared State Model (`chat/models.py`)
+
+Both the agent layer and legacy chat mode share the same state model:
+
+```
+WorkbookState
+├── title: str
+├── theme_key: str
+├── version: int
+└── sheets: list[SheetLayout]
+    ├── name, freeze_row, freeze_col, zoom, tab_color, hidden
+    ├── objects: list[PlacedObject]       # High-level dashboard objects
+    │   ├── id, type, anchor_row, height_rows
+    │   └── payload: PlacedTitle | PlacedChart | PlacedKPIRow | PlacedTable
+    │              | PlacedPivot | PlacedSectionHeader | PlacedText
+    │              | PlacedFilterPanel
+    ├── cell_writes: list[CellWrite]              # Individual cell values/formulas
+    ├── cell_formats: list[CellFormatOp]          # Range formatting
+    ├── conditional_formats: list[ConditionalFormatOp]
+    ├── data_validations: list[DataValidationOp]
+    ├── merges: list[MergeOp]
+    ├── hyperlinks: list[HyperlinkOp]
+    ├── comments: list[CommentOp]
+    ├── images: list[ImageOp]
+    ├── row_heights: dict[int, float]
+    ├── col_widths: dict[int, float]
+    ├── hidden_rows: list[int]
+    └── hidden_cols: list[int]
+```
+
+The renderer (`FlexibleTemplate`) processes high-level objects first, then applies all cell-level operations in order: row heights → col widths → hidden rows/cols → cell writes → cell formats → merges → conditional formats → data validations → hyperlinks → comments → images.
+
+---
+
+## Legacy Chat Mode Architecture (`chat/`)
+
+The legacy chat system uses JSON-based action parsing (not OpenAI tool calling):
 
 ```
 ChatEngine
-├── WorkbookState              # In-memory dashboard model
-│   ├── title, theme_key
-│   └── sheets: list[SheetLayout]
-│       └── objects: list[PlacedObject]
-│           ├── id: str (e.g., "chart_0")
-│           ├── type: ObjectType (title, chart, kpi_row, table, etc.)
-│           ├── anchor_row: int
-│           └── payload: Union[PlacedChart, PlacedKPIRow, PlacedTable, ...]
+├── WorkbookState              # Shared state model (see above)
 │
 ├── REPL Loop
 │   ├── Special commands: auto, start, undo, redo, show, reset, save as, quit
@@ -313,35 +447,14 @@ ChatEngine
 │           ├── add_sheet, change_theme, change_title
 │           └── auto_dashboard
 │
-├── LayoutEngine               # Object positioning
+├── LayoutEngine               # Object positioning (shared with agent)
 │   ├── generate_id()          # Unique IDs per object type
 │   ├── insert_object()        # Place at end, after:id, or row:N
 │   ├── find_half_pair_row()   # Pair half-width charts side-by-side
 │   └── reflow()               # Recompute all positions after remove/move
 │
-├── Undo/Redo Stack            # Deep copies of WorkbookState (max 30)
-│
-└── FlexibleTemplate           # Renders WorkbookState → xlsx
-    ├── Extends BaseXLTemplate
-    ├── Converts state to minimal DashboardConfig for base class
-    └── Dispatches per-object rendering:
-        ├── _render_title()
-        ├── _render_kpi_row()
-        ├── _render_section_header()
-        ├── _render_chart()
-        ├── _render_table()
-        ├── _render_pivot()
-        └── _render_text()
+└── Undo/Redo Stack            # Deep copies of WorkbookState (max 30)
 ```
-
-### Chat LLM Protocol
-
-The chat system prompt includes:
-- Full data schema from `DatasetProfile`
-- Complete action type reference with parameter specs
-- JSON output format specification
-
-Each user turn sends a **state snapshot** (compact one-line-per-object representation) plus the user instruction. The LLM returns structured actions that are parsed and executed in sequence.
 
 ---
 
@@ -375,38 +488,39 @@ Singleton access via `get_settings()`.
                     │  generate-data        │
                     │  build-dashboard      │
                     │  run (full pipeline)  │
-                    │  chat                 │
-                    │  profile              │
-                    │  list                 │
+                    │  agent (NEW)          │
+                    │  chat (legacy)        │
+                    │  profile / list       │
                     └──────────┬───────────┘
                                │
-              ┌────────────────┼────────────────┐
-              ▼                ▼                 ▼
-     ┌────────────┐   ┌──────────────┐   ┌───────────┐
-     │  Generators │   │  Dashboard   │   │   Chat    │
-     │  (9 types)  │   │  Engine      │   │   Engine  │
-     └──────┬─────┘   └──────┬───────┘   └─────┬─────┘
-            │                 │                  │
-            ▼                 ▼                  ▼
-     ┌────────────┐   ┌──────────────┐   ┌───────────────┐
-     │  .xlsx     │   │  Profiling   │   │  WorkbookState│
-     │  datasets  │   │  + LLM Call  │   │  + LLM Actions│
-     └────────────┘   └──────┬───────┘   └───────┬───────┘
-                              │                   │
-                              ▼                   ▼
-                       ┌──────────────┐   ┌───────────────┐
-                       │  Template    │   │  Flexible     │
-                       │  Rendering   │   │  Template     │
-                       └──────┬───────┘   └───────┬───────┘
-                              │                   │
-                              ▼                   ▼
-                       ┌──────────────────────────────┐
-                       │  BaseXLTemplate (xlsxwriter)  │
-                       │  ├── Data sheet               │
-                       │  ├── Calculations (SUMIFS)    │
-                       │  ├── Dashboard (KPIs/Charts)  │
-                       │  └── Deep Analysis            │
-                       └──────────────┬───────────────┘
+         ┌─────────────────────┼─────────────────────┐
+         ▼                     ▼                      ▼
+  ┌────────────┐      ┌──────────────┐      ┌─────────────────┐
+  │  Generators │      │  Dashboard   │      │  AgentSession   │
+  │  (9 types)  │      │  Engine      │      │  (tool calling) │
+  └──────┬─────┘      └──────┬───────┘      └────────┬────────┘
+         │                    │                       │
+         ▼                    ▼                       ▼
+  ┌────────────┐      ┌──────────────┐      ┌─────────────────┐
+  │  .xlsx     │      │  Profiling   │      │  ToolExecutor   │
+  │  datasets  │      │  + LLM Call  │      │  + Registry     │
+  └────────────┘      └──────┬───────┘      └────────┬────────┘
+                              │                       │
+                              ▼                       ▼
+                       ┌──────────────┐      ┌─────────────────┐
+                       │  Template    │      │  WorkbookState  │
+                       │  Rendering   │      │  + Cell Ops     │
+                       └──────┬───────┘      └────────┬────────┘
+                              │                       │
+                              ▼                       ▼
+                       ┌──────────────────────────────────┐
+                       │  FlexibleTemplate (xlsxwriter)    │
+                       │  ├── Data sheet                   │
+                       │  ├── Calculations (SUMIFS)        │
+                       │  ├── Dashboard (objects + cells)  │
+                       │  ├── Extra sheets                 │
+                       │  └── Deep Analysis                │
+                       └──────────────┬───────────────────┘
                                       │
                                       ▼
                                ┌────────────┐
@@ -419,16 +533,22 @@ Singleton access via `get_settings()`.
 
 ## Key Design Decisions
 
-1. **xlsxwriter over openpyxl for output** — xlsxwriter supports charts, sparklines, data validation, and conditional formatting natively. openpyxl is used only for reading input files.
+1. **OpenAI tool calling over JSON parsing** — The agent layer uses native OpenAI function calling (`tool_choice: "auto"`) instead of the legacy approach of parsing raw JSON from LLM text output. This gives structured, validated tool invocations with multi-round follow-up.
 
-2. **SUMIFS-based dynamic formulas** — Instead of static snapshots, dashboards contain live formulas that recalculate when filter dropdowns change in Excel.
+2. **Dual API surface** — `execute_instruction()` uses LLM tool calling for natural language; `execute_tool()` bypasses LLM entirely for programmatic/free access. Both share the same `ToolExecutor` and `ObjectRegistry`.
 
-3. **Two-phase deep analysis** — Statistics are pre-computed in Python to minimize LLM token usage; the LLM only interprets pre-computed numbers.
+3. **Object Registry** — Every artifact (chart, table, KPI row, cell write, merge, etc.) is tracked with a unique ID, operation type, sheet, location, and creation turn. The registry is injected into every LLM turn as context and is snapshot/restored alongside `WorkbookState` for undo/redo.
 
-4. **Fact-dimension auto-join** — Multi-sheet files are automatically unified by detecting fact tables (most rows + most numeric columns) and joining dimension tables via shared text/ID keys.
+4. **Two-layer state model** — `WorkbookState` now has both high-level objects (`PlacedObject` list) and cell-level operations (`CellWrite`, `CellFormatOp`, `ConditionalFormatOp`, etc.). The renderer processes objects first, then overlays cell operations.
 
-5. **JSON repair pipeline** — LLM outputs are aggressively repaired (trailing commas, single quotes, Python booleans, truncated brackets) to maximize reliability.
+5. **xlsxwriter over openpyxl for output** — xlsxwriter supports charts, sparklines, data validation, and conditional formatting natively. openpyxl is used only for reading input files.
 
-6. **State-based chat model** — The chat engine maintains a `WorkbookState` model that is fully serializable, enabling undo/redo via deep copies and incremental modifications via structured actions.
+6. **SUMIFS-based dynamic formulas** — Instead of static snapshots, dashboards contain live formulas that recalculate when filter dropdowns change in Excel.
 
-7. **Universal theme baseline** — All 8 color themes currently share the same universal palette, designed as a single cohesive system. The theme registry is extensible for future differentiation.
+7. **Two-phase deep analysis** — Statistics are pre-computed in Python to minimize LLM token usage; the LLM only interprets pre-computed numbers.
+
+8. **Fact-dimension auto-join** — Multi-sheet files are automatically unified by detecting fact tables (most rows + most numeric columns) and joining dimension tables via shared text/ID keys.
+
+9. **JSON repair pipeline** — LLM outputs are aggressively repaired (trailing commas, single quotes, Python booleans, truncated brackets) to maximize reliability for the legacy chat mode.
+
+10. **Universal theme baseline** — All 8 color themes currently share the same universal palette, designed as a single cohesive system. The theme registry is extensible for future differentiation.

@@ -319,6 +319,27 @@ def chat_command(
     engine.run()
 
 
+# ── agent ─────────────────────────────────────────────────────────────────────
+
+@app.command("agent")
+def agent_command(
+    data_path: Path = typer.Argument(..., help="Path to CSV or Excel data file"),
+    output_path: Optional[Path] = typer.Option(
+        None, "--output", "-o",
+        help="Output dashboard path (auto-named if not specified)"
+    ),
+):
+    """Agentic dashboard builder with OpenAI tool calling."""
+    from ..agent import AgentSession
+
+    if not data_path.exists():
+        console.print(f"[red]File not found: {data_path}[/red]")
+        raise typer.Exit(1)
+
+    session = AgentSession(data_path, output_path)
+    session.run_repl()
+
+
 def main():
     app()
 
